@@ -2290,3 +2290,793 @@ def test_bar_numbers_tell_a_pickup_from_the_bars_after_it():
     reply = results[1]["result"]
     assert reply["numbers"] == [1, 1, 2, 3, 4, 5, 6, 7]
     assert reply["excluded"] == [True] + [False] * 7
+
+
+# ---- Voices 2-4 and staves ----------------------------------------------------------
+# Jazz Piano's bass staff (staff 1) has only voice 1: in each 3/4 bar a quarter, then a half chord.
+
+
+def get_bar(measure):
+    return {
+        "action": "getScore",
+        "params": {"startMeasure": measure, "endMeasure": measure},
+    }
+
+
+def staff_elements(get_score_result, staff, voice=None):
+    """(name, startTick, durationTicks, pitches) of a bar's elements on a staff.
+
+    Elements are in time order; with `voice`, only those of that voice (0-3).
+    """
+    (measure,) = get_score_result["analysis"]["measures"]
+    return [
+        (
+            e["name"],
+            e["startTick"],
+            e["durationTicks"],
+            [n["pitchMidi"] for n in e.get("notes", [])],
+        )
+        for e in sorted(
+            measure["elements"][f"staff{staff}"], key=lambda e: e["startTick"]
+        )
+        if voice is None or e["voice"] == voice
+    ]
+
+
+def in_voice(command, voice):
+    """The command with a voice added to its params."""
+    return {**command, "params": {**command["params"], "voice": voice}}
+
+
+def test_voice_2_notes_start_at_the_cursor_and_leave_voice_1_alone():
+    """Tested feature: voice-2 notes go at the cursor, one after another.
+
+    Check: on the bass staff of bar 2, two voice-2 eighths with advancing start
+    at the bar's first beat and right after it, the cursor ends after the
+    second, and voice 1 of the bar is unchanged.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    results = run(
+        [
+            get_bar(2),
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            in_voice(add_note(45, EIGHTH), 1),
+            in_voice(add_note(47, EIGHTH), 1),
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    before, go, first, second, after = (r["result"] for r in results)
+    assert (
+        go["currentSelection"]["startStaff"],
+        go["currentSelection"]["startTick"],
+    ) == (1, 1440)
+    chords = [e for e in staff_elements(after, 1, voice=1) if e[0] == "Chord"]
+    assert chords == [("Chord", 1440, 240, [45]), ("Chord", 1680, 240, [47])]
+    assert [r["currentSelection"]["startTick"] for r in (first, second)] == [
+        1680,
+        1920,
+    ]
+    assert staff_elements(after, 1, voice=0) == staff_elements(
+        before, 1, voice=0
+    )
+
+
+def test_advancing_in_voice_2_skips_what_was_written():
+    """Tested feature: advancing after a voice-2 write skips what was written.
+
+    Check: a voice-2 half note without advancing, then a pitch added to its
+    chord with the default quarter duration and advancing: the chord keeps its
+    half length and the cursor lands after it (a quarter's advance would land
+    inside it).
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            in_voice(add_note(48, HALF, advance=False), 1),
+            in_voice(add_note(52, QUARTER, add_to_chord=True), 1),
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    added = results[2]["result"]
+    assert added["currentSelection"]["startTick"] == 1440 + 960
+    chords = [
+        e
+        for e in staff_elements(results[3]["result"], 1, voice=1)
+        if e[0] == "Chord"
+    ]
+    assert chords == [("Chord", 1440, 960, [48, 52])]
+
+
+def test_voice_write_inside_a_longer_note_is_refused():
+    """Tested feature: a voice-2 write with nothing to start from is refused.
+
+    Check: at tick 720 on the bass staff, inside a voice-1 half chord, a voice-2
+    rest is refused with the bar unchanged. Following the error's advice
+    (go_to_measure), the same rest is written at the bar's first beat.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: voice-2 writes may start inside a longer
+    voice-1 note.
+    """
+    rest = in_voice(
+        {
+            "action": "addRest",
+            "params": {"duration": EIGHTH, "advanceCursorAfterAction": False},
+        },
+        1,
+    )
+    results = run(
+        [
+            get_bar(1),
+            {
+                "action": "selectCustomRange",
+                "params": {
+                    "startTick": 720,
+                    "endTick": 960,
+                    "startStaff": 1,
+                    "endStaff": 2,
+                },
+            },
+            rest,
+            get_bar(1),
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+            rest,
+            get_bar(1),
+        ],
+        JAZZ,
+    )
+    before, _, refused, unchanged, _, written, after = (
+        r["result"] for r in results
+    )
+    assert (
+        "move the cursor to the start of a voice-1 note or rest first"
+        in refused["error"]
+    )
+    assert staff_elements(unchanged, 1) == staff_elements(before, 1)
+    assert written["success"] is True
+    assert staff_elements(after, 1, voice=1)[0] == ("Rest", 0, 240, [])
+
+
+def test_go_to_measure_on_one_staff_and_next_staff():
+    """Tested feature: go_to_measure on one staff, and next_staff after it.
+
+    Check: go_to_measure(2, staff 1) selects staff 1 only, and next_staff from
+    there fails with the last-staff error.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: go_to_measure loses its staff option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            {"action": "nextStaff", "params": {}},
+        ],
+        JAZZ,
+    )
+    on_staff, last = (r["result"] for r in results)
+    selection = on_staff["currentSelection"]
+    assert (
+        selection["startStaff"],
+        selection["endStaff"],
+        selection["startTick"],
+    ) == (1, 2, 1440)
+    assert last == {"error": "Already at the last staff"}
+
+
+def test_the_plugin_refuses_a_bad_voice():
+    """Tested feature: the plugin refuses any voice but an integer 0-3.
+
+    Check: on the bass staff, add_rest with voice 4, true, "1" and 1.5 each
+    answer the voice error and bar 1 is unchanged; following the error, the same
+    rest with voice 1 (voice 2) is written at the bar's start.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    rest = {
+        "action": "addRest",
+        "params": {"duration": EIGHTH, "advanceCursorAfterAction": False},
+    }
+    bad = [4, True, "1", 1.5]
+    results = run(
+        [
+            get_bar(1),
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+        ]
+        + [in_voice(rest, v) for v in bad]
+        + [get_bar(1), in_voice(rest, 1), get_bar(1)],
+        JAZZ,
+    )
+    before, unchanged, written, after = (
+        r["result"] for r in (results[0], *results[-3:])
+    )
+    for r in results[2:-3]:
+        assert r["result"]["error"].startswith("voice must be an integer 0-3")
+    assert unchanged["analysis"]["measures"] == before["analysis"]["measures"]
+    assert written["success"] is True
+    assert staff_elements(after, 1, voice=1)[0] == ("Rest", 0, 240, [])
+
+
+def voice_chords(get_score_result, staff, voice):
+    """The chord elements of one voice on a staff, over every measure read."""
+    return [
+        e
+        for m in get_score_result["analysis"]["measures"]
+        for e in sorted(
+            m["elements"][f"staff{staff}"], key=lambda e: e["startTick"]
+        )
+        if e["voice"] == voice and e["name"] == "Chord"
+    ]
+
+
+def test_lyrics_in_voice_2():
+    """Tested feature: voice-2 lyrics go on voice-2 notes, up to a gap.
+
+    Check: add_lyrics in voice 2 with no voice-2 note is an error. With voice-2
+    eighths in bar 2 and a note in bar 4, three syllables go on bar 2's two
+    eighths only, stopping at the gap with one left over and the cursor on a
+    voice-2 rest in bar 2.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: add_lyrics loses its voice option.
+    """
+    lyrics = {
+        "action": "addLyrics",
+        "params": {"lyrics": ["la", "di", "x"], "voice": 1},
+    }
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            lyrics,
+            in_voice(add_note(45, EIGHTH), 1),
+            in_voice(add_note(47, EIGHTH), 1),
+            {"action": "goToMeasure", "params": {"measure": 4, "staff": 1}},
+            in_voice(add_note(45, QUARTER), 1),
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            lyrics,
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 2, "endMeasure": 4},
+            },
+        ],
+        JAZZ,
+    )
+    assert (
+        results[1]["result"]["error"]
+        == "Nothing in voice 2 at the cursor to put lyrics on"
+    )
+    added = results[7]["result"]
+    assert (added["addedCount"], added["remainingLyrics"]) == (2, ["x"])
+    assert "stopped at a gap in voice 2" in added["message"]
+    # On the voice-2 rests after the eighths (where MuseScore splits them is its
+    # choice), still in bar 2, before the gap
+    assert 1920 <= added["currentSelection"]["startTick"] < 2880
+    score = results[8]["result"]
+    texts = [
+        [lyric["text"] for lyric in e.get("lyrics", [])]
+        for e in voice_chords(score, 1, voice=1)
+    ]
+    assert texts == [
+        ["la"],
+        ["di"],
+        [],
+    ]  # bar 2's eighths, then bar 4's quarter
+    assert not any(e.get("lyrics") for e in voice_chords(score, 1, voice=0))
+
+
+def test_voice_2_ties_need_adjacent_chords():
+    """Tested feature: voice-2 ties refuse to tie across a gap in the voice.
+
+    Check: voice-2 A2s fill the bass of bar 1 and start bar 3, with no voice 2
+    in bar 2; add_tie from bar 1 and add_tied_note at bar 3 are refused with the
+    gap errors, and no voice-2 note gets a tie.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the tie tools lose their voice option.
+    """
+    dotted_half = {"numerator": 3, "denominator": 4}
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+            in_voice(add_note(45, dotted_half, advance=False), 1),
+            {"action": "goToMeasure", "params": {"measure": 3, "staff": 1}},
+            in_voice(add_note(45, QUARTER, advance=False), 1),
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+            {"action": "addTie", "params": {"voice": 1}},
+            {"action": "goToMeasure", "params": {"measure": 3, "staff": 1}},
+            in_voice(add_tied_note(QUARTER), 1),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 3},
+            },
+        ],
+        JAZZ,
+    )
+    assert results[5]["result"] == {
+        "error": "Nothing in voice 2 right after the cursor to tie to"
+    }
+    assert results[7]["result"] == {
+        "error": "Nothing in voice 2 right before the cursor to tie from"
+    }
+    voice_2 = voice_chords(results[8]["result"], 1, voice=1)
+    assert len(voice_2) == 2
+    assert not any(
+        n.get("tieForward") or n.get("tieBack")
+        for e in voice_2
+        for n in e["notes"]
+    )
+
+
+def test_a_voice_2_line_stays_on_its_staff_across_a_barline():
+    """Tested feature: a voice-2 line keeps its staff across a barline.
+
+    Check: on the bass staff, a voice-2 dotted half fills bar 1 and advances
+    into bar 2, where voice 2 is empty; the next voice-2 quarter goes on the
+    bass staff at bar 2's start, the cursor stays on staff 1, and the treble
+    staff is unchanged.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    dotted_half = {"numerator": 3, "denominator": 4}
+    results = run(
+        [
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 2},
+            },
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+            in_voice(add_note(45, dotted_half), 1),
+            in_voice(add_note(47, QUARTER), 1),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 2},
+            },
+        ],
+        JAZZ,
+    )
+    before, _, first, second, after = (r["result"] for r in results)
+    assert [
+        (
+            r["currentSelection"]["startStaff"],
+            r["currentSelection"]["startTick"],
+        )
+        for r in (first, second)
+    ] == [(1, 1440), (1, 1920)]
+    assert [
+        (
+            e["startTick"],
+            e["durationTicks"],
+            [n["pitchMidi"] for n in e["notes"]],
+        )
+        for e in voice_chords(after, 1, voice=1)
+    ] == [(0, 1440, [45]), (1440, 480, [47])]
+    assert [m["elements"]["staff0"] for m in after["analysis"]["measures"]] == [
+        m["elements"]["staff0"] for m in before["analysis"]["measures"]
+    ]
+
+
+def test_voice_2_rest_and_tuplet_with_advancing():
+    """Tested feature: voice-2 rests and tuplets advance past what they wrote.
+
+    Check: in bar 2's bass, a voice-2 quarter rest with advancing leaves the
+    cursor a quarter on, and a voice-2 eighth triplet (a quarter long) there
+    writes three tuplet rests and leaves the cursor after the triplet.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    triplet = {
+        "action": "addTuplet",
+        "params": {
+            "duration": QUARTER,
+            "ratio": {"numerator": 3, "denominator": 2},
+            "advanceCursorAfterAction": True,
+            "voice": 1,
+        },
+    }
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            {
+                "action": "addRest",
+                "params": {
+                    "duration": QUARTER,
+                    "advanceCursorAfterAction": True,
+                    "voice": 1,
+                },
+            },
+            triplet,
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    _, rest, tuplet, bar = (r["result"] for r in results)
+    assert rest["currentSelection"]["startTick"] == 1440 + 480
+    assert tuplet["currentSelection"]["startTick"] == 1440 + 960
+    (measure,) = bar["analysis"]["measures"]
+    voice_2 = sorted(
+        (e for e in measure["elements"]["staff1"] if e["voice"] == 1),
+        key=lambda e: e["startTick"],
+    )
+    assert (
+        voice_2[0]["name"],
+        voice_2[0]["startTick"],
+        voice_2[0]["isTuplet"],
+    ) == ("Rest", 1440, False)
+    in_triplet = [e for e in voice_2 if 1920 <= e["startTick"] < 2400]
+    assert [(e["startTick"], e["isTuplet"]) for e in in_triplet] == [
+        (1920, True),
+        (2080, True),
+        (2240, True),
+    ]
+
+
+def test_voice_2_ties():
+    """Tested feature: add_tie and add_tied_note tie voice-2 notes.
+
+    Check: after two voice-2 quarter A2s in bar 2's bass, add_tied_note
+    continues the A2 into a third quarter, leaving the cursor after it; then
+    add_tie from the bar's start ties the first two; the three are tied in a
+    chain.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the tie tools lose their voice option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            in_voice(add_note(45, QUARTER), 1),
+            in_voice(add_note(45, QUARTER), 1),
+            in_voice(add_tied_note(QUARTER), 1),
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            {"action": "addTie", "params": {"voice": 1}},
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    tied_note, _, tie, bar = (r["result"] for r in results[3:])
+    assert tied_note["currentSelection"]["startTick"] == 2880
+    assert tie["tiedPitches"] == [45]
+    assert tie["currentSelection"]["startTick"] == 1920
+    chords = voice_chords(bar, 1, voice=1)
+    assert [(e["startTick"], ties(e)[45]) for e in chords] == [
+        (1440, (True, False)),
+        (1920, (True, True)),
+        (2400, (False, True)),
+    ]
+
+
+def test_filling_a_voice_2_triplet():
+    """Tested feature: a voice-2 tuplet written without advancing can be filled.
+
+    Check: in bar 2's bass, a voice-2 eighth triplet written without advancing
+    leaves the cursor on its first beat; three voice-2 eighths then fill it,
+    each a third of a quarter long and in the tuplet, and the cursor ends after
+    the triplet.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    triplet = {
+        "action": "addTuplet",
+        "params": {
+            "duration": QUARTER,
+            "ratio": {"numerator": 3, "denominator": 2},
+            "advanceCursorAfterAction": False,
+            "voice": 1,
+        },
+    }
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            triplet,
+            in_voice(add_note(45, EIGHTH), 1),
+            in_voice(add_note(47, EIGHTH), 1),
+            in_voice(add_note(48, EIGHTH), 1),
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    _, tuplet, *notes, bar = (r["result"] for r in results)
+    assert tuplet["currentSelection"]["startTick"] == 1440
+    assert [n["currentSelection"]["startTick"] for n in notes] == [
+        1600,
+        1760,
+        1920,
+    ]
+    assert [
+        (
+            e["startTick"],
+            e["durationTicks"],
+            e["isTuplet"],
+            [n["pitchMidi"] for n in e["notes"]],
+        )
+        for e in voice_chords(bar, 1, voice=1)
+    ] == [
+        (1440, 160, True, [45]),
+        (1600, 160, True, [47]),
+        (1760, 160, True, [48]),
+    ]
+
+
+def test_a_voice_2_tuplet_past_the_barline_is_refused():
+    """Tested feature: a voice-2 tuplet that would cross the barline is refused.
+
+    Check: on bar 2's last beat in the bass, a voice-2 half-note triplet is
+    refused with the barline error and the bar is unchanged; following the
+    error, a quarter-note triplet there fits and is written.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: add_tuplet loses its voice option.
+    """
+
+    def triplet(duration):
+        return {
+            "action": "addTuplet",
+            "params": {
+                "duration": duration,
+                "ratio": {"numerator": 3, "denominator": 2},
+                "advanceCursorAfterAction": True,
+                "voice": 1,
+            },
+        }
+
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            in_voice(
+                {
+                    "action": "addRest",
+                    "params": {
+                        "duration": HALF,
+                        "advanceCursorAfterAction": True,
+                    },
+                },
+                1,
+            ),
+            get_bar(2),
+            triplet(HALF),
+            get_bar(2),
+            triplet(QUARTER),
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    _, rest, before, refused, unchanged, written, after = (
+        r["result"] for r in results
+    )
+    assert rest["currentSelection"]["startTick"] == 2400
+    assert (
+        "MuseScore wrote no tuplet at tick 2400 in voice 2"
+        " (for example, it doesn't fit before the barline, or it starts where a"
+        " note or rest of that voice sounds through the cursor)"
+        in refused["error"]
+    )
+    assert staff_elements(unchanged, 1) == staff_elements(before, 1)
+    assert written["currentSelection"]["startTick"] == 2880
+    (measure,) = after["analysis"]["measures"]
+    assert [
+        (e["startTick"], e["isTuplet"])
+        for e in sorted(
+            measure["elements"]["staff1"], key=lambda e: e["startTick"]
+        )
+        if e["voice"] == 1 and e["startTick"] >= 2400
+    ] == [(2400, True), (2560, True), (2720, True)]
+
+
+def test_the_plugin_refuses_a_staff_past_the_last():
+    """Tested feature: go_to_measure refuses a staff the score doesn't have.
+
+    Check: on the two-staff example, go_to_measure with staff 2 answers the
+    staff error naming the valid range 0-1; following it, staff 1 is accepted
+    and the cursor is on staff 1 at bar 2's start.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: go_to_measure loses its staff option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 2}},
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+        ],
+        JAZZ,
+    )
+    refused, moved = (r["result"] for r in results)
+    assert refused == {"error": "staff must be an integer 0-1, got 2"}
+    assert (
+        moved["currentSelection"]["startStaff"],
+        moved["currentSelection"]["startTick"],
+    ) == (1, 1440)
+
+
+def test_voice_2_writes_musescore_cannot_make_are_refused():
+    """Tested feature: voice-2 writes that can't be made or checked are refused.
+
+    Check: voice-2 writes MuseScore can't make (inside a voice-2 half rest, a
+    pitch added to a rest) or the plugin can't check (a second tuplet at a
+    tuplet's start) are refused with the bar unchanged. Following the errors, a
+    rest and a tuplet are written.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    rest = in_voice(
+        {
+            "action": "addRest",
+            "params": {"duration": EIGHTH, "advanceCursorAfterAction": False},
+        },
+        1,
+    )
+    triplet = {
+        "action": "addTuplet",
+        "params": {
+            "duration": QUARTER,
+            "ratio": {"numerator": 3, "denominator": 2},
+            "advanceCursorAfterAction": False,
+            "voice": 1,
+        },
+    }
+    to_chord = in_voice(add_note(45, QUARTER, add_to_chord=True), 1)
+    half_rest = in_voice(
+        {
+            "action": "addRest",
+            "params": {"duration": HALF, "advanceCursorAfterAction": False},
+        },
+        1,
+    )
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            half_rest,
+            get_bar(2),
+            {"action": "nextElement", "params": {}},
+            rest,
+            triplet,
+            to_chord,
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            to_chord,
+            get_bar(2),
+            rest,
+            {"action": "goToMeasure", "params": {"measure": 3, "staff": 1}},
+            triplet,
+            get_bar(2),
+            get_bar(3),
+            triplet,
+            get_bar(3),
+        ],
+        JAZZ,
+    )
+    r = [entry["result"] for entry in results]
+    before, moved, unchanged = r[2], r[3], r[9]
+    assert moved["currentSelection"]["startTick"] == 1920
+    sounds = (
+        "it can't start where a note or rest of that voice sounds through"
+        " the cursor"
+    )
+    assert (
+        f"MuseScore wrote no rest at tick 1920 in voice 2 ({sounds})"
+        in (r[4]["error"])
+    )
+    assert "MuseScore wrote no tuplet at tick 1920 in voice 2" in r[5]["error"]
+    assert (
+        "starts where a note or rest of that voice sounds through"
+        in (r[5]["error"])
+    )
+    for refused, tick in ((r[6], 1920), (r[8], 1440)):
+        assert (
+            f"MuseScore wrote no note with pitch 45 at tick {tick} in voice 2"
+            in refused["error"]
+        )
+    assert staff_elements(unchanged, 1) == staff_elements(before, 1)
+    assert r[10]["success"] is True
+    assert r[12]["success"] is True
+    assert staff_elements(r[13], 1, voice=1)[0] == ("Rest", 1440, 240, [])
+    (bar_3,) = r[14]["analysis"]["measures"]
+    assert [
+        (e["startTick"], e["isTuplet"])
+        for e in sorted(
+            bar_3["elements"]["staff1"], key=lambda e: e["startTick"]
+        )
+        if e["voice"] == 1 and e["startTick"] < 2880 + 480
+    ] == [(2880, True), (3040, True), (3200, True)]
+    assert r[15]["error"] == "Error: Voice 2 already has a tuplet at tick 2880"
+    assert staff_elements(r[16], 1) == staff_elements(r[14], 1)
+
+
+def test_advancing_in_voice_2_skips_a_note_split_at_the_barline():
+    """Tested feature: voice-2 advancing skips a note split at a barline.
+
+    Check: in the bass, a voice-2 half note on bar 1's last beat is split into
+    tied quarters across the barline, and advancing leaves the cursor after the
+    second part, at bar 2's second beat.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the write tools lose their voice option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 1, "staff": 1}},
+            in_voice(add_note(45, HALF), 1),
+            in_voice(add_note(47, HALF), 1),
+            {
+                "action": "getScore",
+                "params": {"startMeasure": 1, "endMeasure": 2},
+            },
+        ],
+        JAZZ,
+    )
+    _, first, split, score = (r["result"] for r in results)
+    assert first["currentSelection"]["startTick"] == 960
+    assert split["currentSelection"]["startTick"] == 1920
+    assert [
+        (
+            e["startTick"],
+            e["durationTicks"],
+            [n["pitchMidi"] for n in e["notes"]],
+        )
+        for e in voice_chords(score, 1, voice=1)
+    ] == [(0, 960, [45]), (960, 480, [47]), (1440, 480, [47])]
+
+
+def test_a_voice_2_tied_note_in_a_tuplet_advances_one_slot():
+    """Tested feature: a voice-2 tied note in a tuplet advances one slot.
+
+    Check: in a voice-2 eighth triplet in bar 2's bass, an A2 in slot 1 and a
+    tied A2 in slot 2 with advancing leave the cursor on slot 3, and the two are
+    tied tuplet notes.
+
+    Mocks: none (MuseScore runs headless on an example score).
+
+    Test would be deprecated if: the tie tools lose their voice option.
+    """
+    results = run(
+        [
+            {"action": "goToMeasure", "params": {"measure": 2, "staff": 1}},
+            {
+                "action": "addTuplet",
+                "params": {
+                    "duration": QUARTER,
+                    "ratio": {"numerator": 3, "denominator": 2},
+                    "advanceCursorAfterAction": False,
+                    "voice": 1,
+                },
+            },
+            in_voice(add_note(45, EIGHTH), 1),
+            in_voice(add_tied_note(EIGHTH), 1),
+            get_bar(2),
+        ],
+        JAZZ,
+    )
+    tied_note, bar = results[3]["result"], results[4]["result"]
+    assert tied_note["currentSelection"]["startTick"] == 1760
+    chords = voice_chords(bar, 1, voice=1)
+    assert [
+        (e["startTick"], e["durationTicks"], e["isTuplet"], ties(e)[45])
+        for e in chords
+    ] == [
+        (1440, 160, True, (True, False)),
+        (1600, 160, True, (False, True)),
+    ]

@@ -3,9 +3,39 @@
 from typing import Annotated, List, Optional
 
 from fastmcp import FastMCP
+from pydantic import Field, StrictInt
 
 from ..bars import BAR_HELP, Bar, bar_numbers, send
 from ..client import MuseScoreClient
+
+VOICE_HELP = (
+    "Voice to write in, 0-3 as get_score's JSON numbers them: 0 is voice 1 "
+    "(stems up when a staff has two voices), 1 is voice 2. Default: voice 1. A write in voices 2-4 "
+    "starts at the cursor or fails: voice 1 or that voice must have a note or rest starting there, and "
+    "for a rest or tuplet no earlier note or rest of that voice may sound through it. "
+    "Advancing moves past what was written. Navigation tools move in voice 1."
+)
+"""Description of the voice parameter of the tools that write at the cursor."""
+
+Voice = Annotated[
+    Optional[StrictInt], Field(ge=0, le=3, description=VOICE_HELP)
+]
+"""The voice parameter of the tools that write at the cursor."""
+
+
+def with_voice(params: dict, voice: Optional[int]) -> dict:
+    """Add the voice to a command's parameters when one was given.
+
+    Args:
+        params (dict): The command's parameters.
+        voice (Optional[int]): The voice (0-3), or None for the default.
+
+    Returns:
+        params (dict): The same parameters, with "voice" set if given.
+    """
+    if voice is not None:
+        params["voice"] = voice
+    return params
 
 
 def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
@@ -39,15 +69,19 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             bool,
             "If True, add this pitch to the current chord instead of writing the next melody note",
         ] = False,
+        voice: Voice = None,
     ):
         return await client.request(
             "addNote",
-            {
-                "pitch": pitch,
-                "duration": duration,
-                "advanceCursorAfterAction": advance_cursor_after_action,
-                "addToChord": add_to_chord,
-            },
+            with_voice(
+                {
+                    "pitch": pitch,
+                    "duration": duration,
+                    "advanceCursorAfterAction": advance_cursor_after_action,
+                    "addToChord": add_to_chord,
+                },
+                voice,
+            ),
         )
 
     @mcp.tool(
@@ -58,6 +92,8 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             "of C-E-G into C-E-A with pitches=[60, 64]). Afterwards the cursor is on the second chord, so calling "
             "add_tie again continues a tie chain. Note that after add_note the cursor is already on the next "
             "position: move back to the first note (e.g. with prev_element) before calling add_tie. "
+            "In voices 2-4, prev_element moves in voice 1 and may miss the voice's chord; add_tied_note "
+            "needs no move back. "
             "Write both chords completely before tying: MuseScore treats tied chords as one, so a pitch added "
             "afterwards with add_note(add_to_chord=True) to the second chord is also added, tied, to the first. "
             "While writing music, add_tied_note is usually simpler. "
@@ -70,11 +106,12 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             Optional[List[int]],
             "MIDI pitches to tie (e.g. [60, 64]). Default: every pitch that is in both chords.",
         ] = None,
+        voice: Voice = None,
     ):
         params = {}
         if pitches is not None:
             params["pitches"] = pitches
-        return await client.request("addTie", params)
+        return await client.request("addTie", with_voice(params, voice))
 
     @mcp.tool(
         description=(
@@ -106,6 +143,7 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         advance_cursor_after_action: Annotated[
             bool, "Whether to move the cursor past the new note"
         ] = True,
+        voice: Voice = None,
     ):
         params = {
             "duration": duration,
@@ -115,7 +153,7 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             params["pitches"] = pitches
         if extra_pitches is not None:
             params["extraPitches"] = extra_pitches
-        return await client.request("addTiedNote", params)
+        return await client.request("addTiedNote", with_voice(params, voice))
 
     @mcp.tool(
         description="Add a rest at the current cursor position.",
@@ -129,13 +167,17 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         advance_cursor_after_action: Annotated[
             bool, "Whether to move cursor to next position after adding rest"
         ] = True,
+        voice: Voice = None,
     ):
         return await client.request(
             "addRest",
-            {
-                "duration": duration,
-                "advanceCursorAfterAction": advance_cursor_after_action,
-            },
+            with_voice(
+                {
+                    "duration": duration,
+                    "advanceCursorAfterAction": advance_cursor_after_action,
+                },
+                voice,
+            ),
         )
 
     @mcp.tool(
@@ -160,14 +202,18 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             bool,
             "False (default): stay on the first slot to fill the tuplet; True: move past the whole tuplet",
         ] = False,
+        voice: Voice = None,
     ):
         return await client.request(
             "addTuplet",
-            {
-                "duration": duration,
-                "ratio": ratio,
-                "advanceCursorAfterAction": advance_cursor_after_action,
-            },
+            with_voice(
+                {
+                    "duration": duration,
+                    "ratio": ratio,
+                    "advanceCursorAfterAction": advance_cursor_after_action,
+                },
+                voice,
+            ),
         )
 
     @mcp.tool(
@@ -188,9 +234,11 @@ def setup_notes_measures_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
         verse: Annotated[
             int, "Verse number (0-based, default is 0 for first verse)"
         ] = 0,
+        voice: Voice = None,
     ):
         return await client.request(
-            "addLyrics", {"lyrics": lyrics, "verse": verse}
+            "addLyrics",
+            with_voice({"lyrics": lyrics, "verse": verse}, voice),
         )
 
     @mcp.tool(

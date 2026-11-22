@@ -6,6 +6,7 @@ plugin and the mock all come from them.
 """
 
 from typing import (
+    Annotated,
     Any,
     Callable,
     Dict,
@@ -21,7 +22,17 @@ from typing import (
     is_typeddict,
 )
 
+from pydantic import Field, StrictInt
+
 from ..bars import Bar
+
+Voice = Annotated[StrictInt, Field(ge=0, le=3)]
+"""A voice to write in, 0-3 (0 is voice 1): integers only, so true or "1" is
+refused.
+"""
+
+Staff = Annotated[StrictInt, Field(ge=0)]
+"""A staff, 0-based from the top: integers only."""
 
 
 class getScoreAction(TypedDict):
@@ -34,6 +45,7 @@ class addNoteParams(TypedDict):
     duration: Dict[Literal["numerator", "denominator"], int]
     advanceCursorAfterAction: bool
     addToChord: NotRequired[bool]
+    voice: NotRequired[Voice]
 
 
 class addNoteAction(TypedDict):
@@ -44,6 +56,7 @@ class addNoteAction(TypedDict):
 class addRestParams(TypedDict):
     duration: Dict[Literal["numerator", "denominator"], int]
     advanceCursorAfterAction: bool
+    voice: NotRequired[Voice]
 
 
 class addRestAction(TypedDict):
@@ -55,6 +68,7 @@ class addTupletParams(TypedDict):
     duration: Dict[Literal["numerator", "denominator"], int]
     ratio: Dict[Literal["numerator", "denominator"], int]
     advanceCursorAfterAction: bool
+    voice: NotRequired[Voice]
 
 
 class addTupletAction(TypedDict):
@@ -64,6 +78,7 @@ class addTupletAction(TypedDict):
 
 class addTieParams(TypedDict):
     pitches: NotRequired[List[int]]
+    voice: NotRequired[Voice]
 
 
 class addTieAction(TypedDict):
@@ -76,6 +91,7 @@ class addTiedNoteParams(TypedDict):
     advanceCursorAfterAction: bool
     pitches: NotRequired[List[int]]
     extraPitches: NotRequired[List[int]]
+    voice: NotRequired[Voice]
 
 
 class addTiedNoteAction(TypedDict):
@@ -86,6 +102,7 @@ class addTiedNoteAction(TypedDict):
 class addLyricsParams(TypedDict):
     lyrics: List[str]
     verse: int
+    voice: NotRequired[Voice]
 
 
 class addLyricsAction(TypedDict):
@@ -139,6 +156,7 @@ class getCursorInfoAction(TypedDict):
 
 class goToMeasureParams(TypedDict):
     measure: Bar
+    staff: NotRequired[Staff]
 
 
 class goToMeasureAction(TypedDict):

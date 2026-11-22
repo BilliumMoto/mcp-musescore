@@ -60,7 +60,11 @@ def setup_sequence_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
             "Bars (measure, toMeasure, startMeasure/endMeasure, inclusive) are as printed in the score before the sequence "
             'runs (a pickup bar is 0; a number printed twice is "12a"/"12b"), even after a step that inserts or '
             "deletes bars; staves use startStaff/endStaff (0-based, endStaff exclusive). "
-            "Processing stops at the first invalid action or failing step, and the error names it; "
+            "The write steps (addNote, addRest, addTie, addTiedNote, addTuplet, addLyrics) take an optional "
+            "voice (0-3, 0 is voice 1) and goToMeasure an optional staff (0-based). "
+            "Processing stops at the first invalid action or failing step (an error, or an answer with "
+            "success: false, such as setRepeatBarlines answering with a manual fallback before "
+            "MuseScore 4.6), and the error names it; "
             "the steps before it stay applied."
         ),
         tags={"sequence"},

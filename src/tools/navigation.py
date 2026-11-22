@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, Optional
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field, StrictInt
 
 from ..bars import BAR_HELP, Bar, bar_numbers
 from ..client import MuseScoreClient
@@ -113,16 +114,28 @@ def setup_navigation_tools(mcp: FastMCP, client: MuseScoreClient) -> None:
 
     @mcp.tool(
         description=(
-            "Navigate to a bar and select it across all staves. The cursor moves to beat 1 "
-            "of that bar on the first staff, so the next cursor tool (add_note, add_rest, add_lyrics, "
-            "set_time_signature...) acts there; use next_staff to move down to another staff."
+            "Navigate to a bar. Without staff, select it across all staves with the cursor on beat 1 "
+            "of the first staff; next_staff then moves the cursor down one staff at a time. With staff, "
+            "select the bar on that staff only, with the cursor on its beat 1. The next cursor tool "
+            "(add_note, add_rest, add_lyrics, set_time_signature...) acts at the cursor; the write tools "
+            "take a voice to write in."
         ),
         tags={"navigation"},
     )
     async def go_to_measure(
         measure: Annotated[Bar, f"Bar to go to, {BAR_HELP}"],
+        staff: Annotated[
+            Optional[StrictInt],
+            Field(
+                ge=0,
+                description="Staff to put the cursor on, 0-based from the top. Default: all staves, cursor on staff 0.",
+            ),
+        ] = None,
     ):
-        return await _run_and_convert("goToMeasure", {"measure": measure})
+        params = {"measure": measure}
+        if staff is not None:
+            params["staff"] = staff
+        return await _run_and_convert("goToMeasure", params)
 
     @mcp.tool(
         description="Navigate to the final measure of the score.",

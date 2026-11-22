@@ -310,9 +310,13 @@ MuseScore {
         var cursor = curScore.newCursor();
         cursor.inputStateMode = Cursor.INPUT_STATE_SYNC_WITH_SCORE;
         
-        // Set track
+        // Set track. The voice is set on every cursor, 0 (voice 1) when not given: with
+        // INPUT_STATE_SYNC_WITH_SCORE the track lives in the score's input state, so an unset
+        // voice would carry over from the last write into navigation (MuseScore v4.7.0,
+        // src/engraving/api/v1/cursor.cpp: track()/setTrack() use the input state).
         if (params.startStaff !== undefined) cursor.staffIdx = params.startStaff;
-        if (params.voice !== undefined) cursor.voice = params.voice;
+        var voice = params.voice !== undefined && params.voice !== null ? params.voice : 0;
+        cursor.voice = voice;
         
         // Position cursor
         if (params.rewindMode !== undefined) {
@@ -331,13 +335,92 @@ MuseScore {
         } else {
             cursor.rewind(0);
         }
-        
+
+        // rewindToTick moves on to the next segment with an element in the cursor's track
+        // (cursor.cpp, nextInTrack), so in a voice with nothing at startTick, such as an empty
+        // voice 2, it lands elsewhere or nowhere. Position in voice 1 then, and switch to the voice
+        // there: setting the voice keeps the segment.
+        var missed = function() { return !cursor.segment || cursor.tick !== params.startTick; };
+        if (voice !== 0 && params.startTick !== undefined && params.rewindMode === undefined && missed()) {
+            cursor.voice = 0;
+            cursor.rewindToTick(params.startTick);
+            cursor.voice = voice;
+        }
+        // A write must happen at its tick, never later. tests/test_plugin_headless.py follows this
+        // advice (test_voice_write_inside_a_longer_note_is_refused).
+        if (params.exactTick && params.startTick !== undefined && missed()) {
+            throw new Error("Nothing to write from at tick " + params.startTick + " on staff " + cursor.staffIdx +
+                            " in voice 1 or voice " + (voice + 1) + " (e.g. inside a longer voice-1 note); " +
+                            "move the cursor to the start of a voice-1 note or rest first");
+        }
+
         // Set duration
         if (params.duration) {
             cursor.setDuration(params.duration.numerator || 1, params.duration.denominator || 4);
         }
         
         return cursor;
+    }
+
+    // The voice (0-3, MuseScore's numbering: 0 is voice 1) a write tool writes into, from its optional
+    // params.voice. Missing or null means voice 0, as before this option existed. Anything else that isn't
+    // an integer 0-3 (a boolean, a string, 1.5, 4) is refused rather than guessed. The server
+    // refuses these first (tests/test_voice_staff.py); tests/test_plugin_headless.py checks this one.
+    function writeVoice(params) {
+        var v = params ? params.voice : undefined;
+        if (v === undefined || v === null) return { voice: 0 };
+        if (typeof v !== "number" || Math.floor(v) !== v || v < 0 || v > 3) {
+            return { error: "voice must be an integer 0-3 (0 is voice 1), got " + JSON.stringify(v) };
+        }
+        return { voice: v };
+    }
+
+    // Cursor parameters for writing at the cursor state's position, in `voice`. A write in
+    // voices 2-4 must land at that tick or fail (exactTick); voice 1 keeps its old positioning.
+    function writeCursorParams(voice) {
+        return { startTick: selectionState.startTick, startStaff: selectionState.startStaff, voice: voice,
+                 exactTick: voice !== 0 };
+    }
+
+    // Ticks from `tick` to just after `element` in `voice`: its actual duration and, with followTies, the tied
+    // parts MuseScore splits a note into at a barline, as tickAfter does in voice 1.
+    function voiceTicksAfter(element, tick, staffIdx, voice, followTies) {
+        var ticks = 0;
+        var el = element;
+        while (true) {
+            ticks += el.actualDuration.ticks;
+            var tied = followTies && el.notes && el.notes.length > 0 && el.notes[0].tieForward;
+            if (!tied) return ticks;
+            var next = createCursor({ startTick: tick + ticks, startStaff: staffIdx, voice: voice });
+            if (!next.segment || next.tick !== tick + ticks || !next.element) return ticks;
+            el = next.element;
+        }
+    }
+
+    // Cursor state after a write in voice 2-4: on the written element, or just after it when
+    // advancing. cursor.next() can't be used for that in those voices: it jumps to the voice's
+    // next element anywhere later in the score, or to nothing. Advancing skips the element written
+    // at `tick` (with followTies also the tied parts of a note split at a barline, as addNote does in
+    // voice 1), not the requested duration: a pitch added to a chord takes the chord's length, and a
+    // note in a tuplet its tuplet length. Pass `ticks` only where the length to skip is known (a whole
+    // tuplet), else null.
+    // MuseScore writes nothing, silently, where it can't write (a rest where an earlier note or rest of
+    // the voice sounds through the tick, a pitch added where the voice has no chord), so the element at
+    // `tick` must pass `wrote`; else this throws "MuseScore wrote no <what> ...<hint>", and the write is
+    // undone. Pass `wrote` null only where the caller has checked the write itself (a tuplet).
+    function afterVoiceWrite(tick, staffIdx, ticks, advance, voice, message, wrote, what, hint, followTies) {
+        if (wrote) {
+            var written = createCursor({ startTick: tick, startStaff: staffIdx, voice: voice });
+            if (!written.segment || written.tick !== tick || !written.element || !wrote(written.element)) {
+                throw new Error("MuseScore wrote no " + what + " at tick " + tick + " in voice " + (voice + 1) +
+                                (hint || ""));
+            }
+            if (ticks === null) ticks = voiceTicksAfter(written.element, tick, staffIdx, voice, followTies);
+        } else if (ticks === null) {
+            throw new Error("afterVoiceWrite needs ticks when the write is not checked");
+        }
+        var state = moveCursorTo(advance ? tick + ticks : tick, staffIdx, voice);
+        return { success: true, message: message, currentSelection: state };
     }
 
     function initCursorState() {
@@ -484,10 +567,15 @@ MuseScore {
                 // A failing step stops the sequence, so later steps don't build on it and the
                 // reply doesn't claim success. Each step is its own undo command, so earlier ones stay.
                 var result = processCommand(command);
-                if (result && typeof result === "object" && result.error !== undefined) {
+                // A step can also fail by answering success: false (e.g. setRepeatBarlines' manual fallback).
+                var failure = result && typeof result === "object"
+                    ? (result.error !== undefined ? result.error
+                       : (result.success === false ? (result.message || "the step reported success: false") : undefined))
+                    : undefined;
+                if (failure !== undefined) {
                     return {
                         error: "Step " + (i + 1) + " of " + params.sequence.length + " (" + command.action +
-                               ") failed: " + result.error + ". " +
+                               ") failed: " + failure + ". " +
                                (i ? "Steps 1-" + i + " were applied." : "No step was applied.")
                     };
                 }
@@ -550,11 +638,19 @@ MuseScore {
                     totalDuration: endTick - startSegment.tick
                 };
             } else {
+                // Nothing selected (the user chose no new position; a write in voices 2-4 into an empty bar
+                // clears the selection too): the plugin's own state is the position. Its elements are read
+                // again from a voice-1 cursor at its staff and tick; where nothing starts there in voice 1
+                // (inside a longer voice-1 note) that cursor lands elsewhere, so the state is kept as it is.
+                // The staff comes from the state, never from the cleared selection, which says staff 0.
                 var c = createCursor();
+                if (c && c.segment && selectionState.startTick !== undefined && c.tick !== selectionState.startTick) {
+                    return { success: true, currentSelection: selectionState };
+                }
                 if (c && c.element) {
                     var elElement = processElement(c.element);
                     elElement.startTick = c.tick;
-                    var sStart = selection.startStaff || 0;
+                    var sStart = c.staffIdx;
                     var singleMap = {};
                     singleMap[`staff${sStart}`] = [elElement];
                     
@@ -587,8 +683,8 @@ MuseScore {
         };
     }
 
-    // Select one whole measure on every staff and move the cursor state to its first beat
-    // (staff 0), where the next cursor action (addNote, setTimeSignature, addLyrics...) acts.
+    // Select one whole measure (on every staff, or on the range's staves) and move the cursor state to its
+    // first beat (on the first of them), where the next cursor action (addNote, setTimeSignature, addLyrics...) acts.
     // Selecting is not a score edit, so this runs outside startCmd()/endCmd(): inside a
     // command the new selection has no segments yet, syncStateToSelection() fell back to
     // the previous cursor position (often bar 1), and the following actions landed there.
@@ -610,7 +706,18 @@ MuseScore {
             return { error: "Invalid measure number" };
         }
 
-        var range = measureRange({ startMeasure: params.measure });
+        // Optional staff (0-based): select the bar on that staff only, so the cursor tools act there.
+        // Without it the bar is selected on every staff, with the cursor on staff 0.
+        var rangeParams = { startMeasure: params.measure };
+        if (params.staff !== undefined && params.staff !== null) {
+            if (typeof params.staff !== "number" || Math.floor(params.staff) !== params.staff ||
+                    params.staff < 0 || params.staff >= curScore.nstaves) {
+                return { error: "staff must be an integer 0-" + (curScore.nstaves - 1) + ", got " + JSON.stringify(params.staff) };
+            }
+            rangeParams.startStaff = params.staff;
+            rangeParams.endStaff = params.staff + 1;
+        }
+        var range = measureRange(rangeParams);
         if (!range.valid) return range;
         return selectWholeMeasure(range);
     }
@@ -871,15 +978,29 @@ MuseScore {
             return { error: "Duration must be specified as { numerator: int, denominator: int }" };
         }
 
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
             
-            var cursor = createCursor();
+            var cursor = createCursor(writeCursorParams(voice.voice));
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
             
             // Melody is the default. Pass addToChord: true to stack a pitch on the current chord.
             var addToChord = params.addToChord === true;
             cursor.addNote(params.pitch, addToChord);
+            if (voice.voice !== 0) {
+                return afterVoiceWrite(selectionState.startTick, cursor.staffIdx, null,
+                    params.advanceCursorAfterAction, voice.voice, "Note added with pitch " + params.pitch,
+                    function(e) {
+                        if (e.type !== Element.CHORD) return false;
+                        for (var n = 0; n < e.notes.length; n++) {
+                            if (e.notes[n].pitch === params.pitch) return true;
+                        }
+                        return false;
+                    }, "note with pitch " + params.pitch, null, !addToChord);
+            }
             var startTick = selectionState.startTick;
             var staffIdx = cursor.staffIdx;
 
@@ -919,7 +1040,7 @@ MuseScore {
     // a new tied note and overwrites the music after it. So only notes whose pitch is in both chords are
     // selected. Returns { error } when nothing can be tied, else the tied, already tied and skipped pitches.
     // Throws when MuseScore did not make a tie, which rolls the whole action back.
-    function tieMatchingNotes(first, second, firstTick, staffIdx, requested) {
+    function tieMatchingNotes(first, second, firstTick, staffIdx, requested, voice) {
         var firstPitches = chordPitches(first);
         var secondPitches = chordPitches(second);
         var candidates = requested || firstPitches;
@@ -955,7 +1076,7 @@ MuseScore {
         }
 
         // Check the result on a fresh cursor
-        var check = createCursor({ startTick: firstTick, startStaff: staffIdx });
+        var check = createCursor({ startTick: firstTick, startStaff: staffIdx, voice: voice || 0 });
         var tied = [];
         for (var n = 0; n < toTie.length; n++) {
             var tiedNote = noteWithPitch(check.element, toTie[n].pitch);
@@ -990,8 +1111,10 @@ MuseScore {
         return moveCursorTo(tick, staffIdx);
     }
 
-    function moveCursorTo(tick, staffIdx) {
-        var element = processElement(createCursor({ startTick: tick, startStaff: staffIdx }).element);
+    function moveCursorTo(tick, staffIdx, voice) {
+        var at = createCursor({ startTick: tick, startStaff: staffIdx, voice: voice || 0 });
+        // In voices 2-4 nothing may start at `tick` (an empty voice): then there is no element.
+        var element = at.segment && at.tick === tick ? processElement(at.element) : null;
         var ticks = element ? element.durationTicks : 0;
         curScore.selection.clear();
         if (ticks > 0) curScore.selection.selectRange(tick, tick + ticks, staffIdx, staffIdx + 1);
@@ -1018,10 +1141,13 @@ MuseScore {
     function addTie(params) {
         params = params || {};
 
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
 
-            var cursor = createCursor({ startTick: selectionState.startTick, startStaff: selectionState.startStaff });
+            var cursor = createCursor(writeCursorParams(voice.voice));
             var first = cursor.element;
             var firstTick = cursor.tick;
             if (!first || first.name !== "Chord") {
@@ -1033,12 +1159,16 @@ MuseScore {
             var second = cursor.element;
             var secondTick = cursor.tick;
             var staffIdx = cursor.staffIdx;
+            // In voices 2-4 cursor.next() skips gaps in the voice: tie only to what starts where this chord ends
+            if (voice.voice !== 0 && secondTick !== firstTick + first.actualDuration.ticks) {
+                return { error: "Nothing in voice " + (voice.voice + 1) + " right after the cursor to tie to" };
+            }
             if (second.name !== "Chord") {
                 return { error: "The element after the cursor is a rest: a tie needs a note of the same pitch" };
             }
 
             var requested = params.pitches && params.pitches.length ? params.pitches : null;
-            var result = tieMatchingNotes(first, second, firstTick, staffIdx, requested);
+            var result = tieMatchingNotes(first, second, firstTick, staffIdx, requested, voice.voice);
             if (result.error) return result;
 
             return {
@@ -1047,7 +1177,7 @@ MuseScore {
                 tiedPitches: result.tied,
                 alreadyTied: result.alreadyTied,
                 skippedPitches: result.skipped,
-                currentSelection: moveCursorTo(secondTick, staffIdx)
+                currentSelection: moveCursorTo(secondTick, staffIdx, voice.voice)
             };
         });
     }
@@ -1064,16 +1194,23 @@ MuseScore {
             return { error: "Duration must be specified as { numerator: int, denominator: int }" };
         }
 
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
 
-            var cursor = createCursor({ startTick: selectionState.startTick, startStaff: selectionState.startStaff });
+            var cursor = createCursor(writeCursorParams(voice.voice));
             var tick = cursor.tick;
             var staffIdx = cursor.staffIdx;
             if (!cursor.prev() || !cursor.element || cursor.element.name !== "Chord") {
                 return { error: "No note or chord before the cursor to tie from" };
             }
             var previousTick = cursor.tick;
+            // In voices 2-4 cursor.prev() skips gaps in the voice: tie only from what ends at the cursor
+            if (voice.voice !== 0 && previousTick + cursor.element.actualDuration.ticks !== tick) {
+                return { error: "Nothing in voice " + (voice.voice + 1) + " right before the cursor to tie from" };
+            }
             var previousPitches = chordPitches(cursor.element);
 
             var pitches = [];
@@ -1098,7 +1235,7 @@ MuseScore {
             }
 
             // Write the whole new chord first, as addNote does
-            var writer = createCursor({ startTick: tick, startStaff: staffIdx });
+            var writer = createCursor({ startTick: tick, startStaff: staffIdx, voice: voice.voice });
             writer.setDuration(params.duration.numerator, params.duration.denominator);
             writer.addNote(chordPitchList[0], false);
             for (var p = 1; p < chordPitchList.length; p++) {
@@ -1106,16 +1243,20 @@ MuseScore {
                 writer.addNote(chordPitchList[p], true);
             }
 
-            var previous = createCursor({ startTick: previousTick, startStaff: staffIdx }).element;
-            var written = createCursor({ startTick: tick, startStaff: staffIdx }).element;
-            var result = tieMatchingNotes(previous, written, previousTick, staffIdx, pitches);
+            var previous = createCursor({ startTick: previousTick, startStaff: staffIdx, voice: voice.voice }).element;
+            var written = createCursor({ startTick: tick, startStaff: staffIdx, voice: voice.voice }).element;
+            var result = tieMatchingNotes(previous, written, previousTick, staffIdx, pitches, voice.voice);
             if (result.error) throw new Error(result.error);  // rolls the written chord back as well
 
             // Advancing skips the whole written duration: a note longer than the rest of the bar is split by
             // MuseScore into tied notes, and the cursor must not land on the second part
+            // In voices 2-4 it skips what was written, tied parts included (a note in a tuplet is shorter than its
+            // nominal duration)
             var target = tick;
             if (params.advanceCursorAfterAction) {
-                target = tick + 1920 * params.duration.numerator / params.duration.denominator;
+                target = voice.voice !== 0
+                    ? tick + voiceTicksAfter(written, tick, staffIdx, voice.voice, true)
+                    : tick + 1920 * params.duration.numerator / params.duration.denominator;
             }
 
             return {
@@ -1123,7 +1264,7 @@ MuseScore {
                 message: "Added tied " + (chordPitchList.length > 1 ? "chord " : "note ") + chordPitchList.join(", ") +
                     (chordPitchList.length > pitches.length ? " (tied: " + pitches.join(", ") + ")" : ""),
                 tiedPitches: result.tied,
-                currentSelection: moveCursorTo(target, staffIdx)
+                currentSelection: moveCursorTo(target, staffIdx, voice.voice)
             };
         });
     }
@@ -1136,12 +1277,21 @@ MuseScore {
             return { error: "Duration must be specified as { numerator: int, denominator: int }" };
         }
 
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
             
-            var cursor = createCursor();
+            var cursor = createCursor(writeCursorParams(voice.voice));
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
             cursor.addRest();
+            if (voice.voice !== 0) {
+                return afterVoiceWrite(selectionState.startTick, cursor.staffIdx, null,
+                    params.advanceCursorAfterAction, voice.voice, "Rest added",
+                    function(e) { return e.type === Element.REST; },
+                    "rest", " (it can't start where a note or rest of that voice sounds through the cursor)", false);
+            }
             cursor.rewindToTick(selectionState.startTick);
 
             if (params.advanceCursorAfterAction) {
@@ -1176,10 +1326,19 @@ MuseScore {
             return { error: "Ratio and duration must be specified as { numerator: int, denominator: int }" };
         }
         
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
 
-            var cursor = createCursor();
+            var cursor = createCursor(writeCursorParams(voice.voice));
+            // In voices 2-4 the check after writing looks for a tuplet at the tick, so one already there
+            // would pass it whether or not MuseScore wrote the new one: refuse that case first
+            if (voice.voice !== 0 && cursor.element && cursor.element.tuplet) {
+                throw new Error("Voice " + (voice.voice + 1) + " already has a tuplet at tick " +
+                                selectionState.startTick);
+            }
             var startTick = cursor.tick;
             var staffIdx = cursor.staffIdx;
             cursor.setDuration(params.duration.numerator, params.duration.denominator);
@@ -1188,6 +1347,22 @@ MuseScore {
             var duration = fraction(params.duration.numerator, params.duration.denominator);
 
             cursor.addTuplet(ratio, duration);
+            if (voice.voice !== 0) {
+                // MuseScore writes nothing, silently, for a tuplet that would cross the barline, has a bad
+                // length, or starts where a note or rest of the voice sounds through: refuse then rather than
+                // report a tuplet and move past it
+                var written = createCursor({ startTick: startTick, startStaff: staffIdx, voice: voice.voice });
+                if (!written.segment || written.tick !== startTick || !written.element || !written.element.tuplet) {
+                    throw new Error("MuseScore wrote no tuplet at tick " + startTick + " in voice " +
+                                    (voice.voice + 1) + " (for example, it doesn't fit before the barline, or " +
+                                    "it starts where a note or rest of that voice sounds through the cursor)");
+                }
+                return afterVoiceWrite(startTick, staffIdx,
+                    1920 * params.duration.numerator / params.duration.denominator,
+                    params.advanceCursorAfterAction, voice.voice,
+                    "Tuplet " + params.ratio.numerator + ":" + params.ratio.denominator + " added",
+                    null, null, null, false);
+            }
 
             // Without advancing, the cursor stays on the tuplet's first slot, so the following addNotes fill it
             // slot by slot. Advancing moves past the whole tuplet (duration is its total length). The state is
@@ -1214,13 +1389,13 @@ MuseScore {
             return { error: "Lyrics must be specified as an array of strings" };
         }
 
+        var voice = writeVoice(params);
+        if (voice.error) return voice;
+
         return executeWithUndo(function() {
             syncStateToSelection();
 
-            var cursor = createCursor({
-                startTick: selectionState.startTick,
-                startStaff: selectionState.startStaff
-            });
+            var cursor = createCursor(writeCursorParams(voice.voice));
 
             var lyricsArray = params.lyrics.slice();
             var verse = params.verse || 0;
@@ -1228,6 +1403,11 @@ MuseScore {
             var heldCount = 0;
             var skippedCount = 0;
             var previous = null;  // last syllable placed: { lyric, tick, hyphen }
+            var lastTick = cursor.tick;  // tick of the last element visited
+            var stoppedAtGap = false;
+            if (voice.voice !== 0 && !cursor.element) {
+                return { error: "Nothing in voice " + (voice.voice + 1) + " at the cursor to put lyrics on" };
+            }
 
             while (cursor.element && lyricsArray.length > 0) {
                 var element = cursor.element;
@@ -1258,12 +1438,26 @@ MuseScore {
                     skippedCount++;
                 }
 
+                lastTick = cursor.tick;
+                var nextTick = cursor.tick + element.actualDuration.ticks;
                 if (!cursor.next()) break;
+                // In voices 2-4 cursor.next() skips gaps in the voice, to its next element bars later:
+                // syllables stop at a gap instead
+                if (voice.voice !== 0 && cursor.tick !== nextTick) {
+                    stoppedAtGap = true;
+                    break;
+                }
             }
-            
-            var finalElement = processElement(cursor.element) || selectionState.elements[0];
-            var finalTick = cursor.tick;
+
+            // Past the last chord the cursor has no element (routine in voices 2-4, where
+            // cursor.next() finds no more of the voice), or it is past a gap in the voice: stay on
+            // the last element visited then.
             var staffIdx = cursor.staffIdx;
+            var onNext = cursor.element && !stoppedAtGap;
+            var finalTick = onNext ? cursor.tick : lastTick;
+            var finalElement = (onNext ? processElement(cursor.element)
+                : processElement(createCursor({ startTick: lastTick, startStaff: staffIdx, voice: voice.voice }).element))
+                || { durationTicks: 0 };
             
             selectionState = {
                 startStaff: staffIdx,
@@ -1280,6 +1474,7 @@ MuseScore {
             if (heldCount > 0) message += `, held ${heldCount} notes`;
             if (skippedCount > 0) message += `, skipped ${skippedCount} rests`;
             if (lyricsArray.length > 0) message += `, ${lyricsArray.length} lyrics remaining`;
+            if (stoppedAtGap && lyricsArray.length > 0) message += ` (stopped at a gap in voice ${voice.voice + 1})`;
 
             return {
                 success: true,

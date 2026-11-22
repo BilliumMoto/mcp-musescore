@@ -3,7 +3,9 @@
 Speaks the same envelope as musescore-mcp-websocket.qml ({"status": "success",
 "result": ...} / {"status": "error", "message": ...}) over a simple 4/4-style
 score, so the MCP server can be run and tested without MuseScore. Only a subset
-of actions is implemented; others return "Unknown command".
+of actions is implemented; others return "Unknown command". It doesn't model
+writing into voices 2-4, goToMeasure's staff, or processSequence stopping on a
+step that answers success: false; it writes in voice 1 and ignores them.
 
 Run standalone on the plugin's port: python tests/mock_musescore.py [--demo]
 """
